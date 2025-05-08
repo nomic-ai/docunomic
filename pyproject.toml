@@ -1,0 +1,9 @@
+[project]
+name = "docunomic"
+version = "0.1.0"
+description = "Document processing for Nomic"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "docling>=2.31.0",
+]
