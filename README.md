@@ -58,8 +58,8 @@ Results on my nomic macbook m3 16gb:
 
 ```bash
 --- Test Execution Summary ---
-CPU Sequential: 45.5142 seconds
-CPU Concurrent: 42.1427 seconds
-MPS Sequential: 24.6420 seconds
-MPS Concurrent: 38.2389 seconds
+CPU Sequential: 77.0414 seconds
+CPU Concurrent: 46.5164 seconds
+MPS Sequential: 62.7123 seconds
+MPS Concurrent: 53.7256 seconds
 ```
