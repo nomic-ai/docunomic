@@ -23,12 +23,6 @@ logger = logging.getLogger(__name__)
 # Reduce verbosity of docling's logger
 logging.getLogger("docling").setLevel(logging.WARNING)
 
-# # Define the expected CSV field names to ensure consistency when appending
-# CSV_FIELD_NAMES = [
-#     "id", "text", "source_pdf_filename", "heading", "page_number", 
-#     "document_title", "part", "category", "docling_origin_filename",
-#     "docling_origin_meta_json"
-# ]
 
 def _get_processed_pdfs(progress_file: Path) -> Set[str]:
     """
@@ -515,7 +509,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Define the input directory for PDFs and the output file path
-    pdf_input_dir = Path(args.pdf_input_dir)
+    pdf_input_dir = Path(args.input_dir)
     output_csv_file = Path(args.output_file)
 
     selected_accelerator = AcceleratorDevice.CPU

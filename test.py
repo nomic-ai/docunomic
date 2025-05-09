@@ -1,5 +1,3 @@
-# TODO test run.py on single test PDF (the pdf /Users/max/Desktop/nomic-repos/boardman/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/CreditcardscomInc_20070810_S-1_EX-10.33_362297_EX-10.33_Affiliate Agreement.pdf)
-
 import unittest
 import tempfile
 import shutil
@@ -33,7 +31,7 @@ class TestPdfProcessing(unittest.TestCase):
         self.mps_concurrent_output_file = self.test_dir / "output_chunks_mps_concurrent.csv"
 
         # Directory containing all source PDFs for the test
-        self.source_agreements_dir = Path("/Users/max/Desktop/nomic-repos/boardman/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/")
+        self.source_agreements_dir = Path("data/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/")
 
         if not self.source_agreements_dir.is_dir():
             raise FileNotFoundError(f"Source PDF directory not found: {self.source_agreements_dir}")
