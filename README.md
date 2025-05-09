@@ -6,6 +6,8 @@ Document processing for Nomic
 
 ## Demo
 
+Download [CUAD_v1](https://pub-2f787ac515f74bafa6b547f8bcd01f11.r2.dev) (demo PDF dataset, sourced from [Kaggle](https://www.kaggle.com/datasets/konradb/atticus-open-contract-dataset-aok-beta))  and unzip it in the `data/` directory.
+
 #### How do you get this data into Atlas?
 
 ```bash
@@ -34,9 +36,8 @@ Document processing for Nomic
 ```
 
 #### Run docunomic!
-
 ```bash
-uv run main.py input_dir data/CUAD_v1/full_contract_pdf output_file cuad.csv
+uv run main.py data/CUAD_v1/full_contract_pdf cuad.csv
 ```
 
 This produces a CSV ready for Atlas
@@ -47,7 +48,7 @@ This produces a CSV ready for Atlas
 ...
 ## Diagnostic test
 
-This test processes the 9 pdfs in `CUAD_v1/full_contract_pdf/Part_1/Affiliate_Agreements/` to test the performance of hardware and processing configuration
+This test processes the 9 pdfs in `CUAD_v1/full_contract_pdf/Part_1/Affiliate_Agreements/` to test hardware and processing configuration on your machine
 
 ```bash
 uv run test.py

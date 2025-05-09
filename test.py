@@ -11,7 +11,7 @@ import os # For listing files if needed, though Path.glob should suffice
 import multiprocessing # Added for setting start method
 
 # Assuming run.py is in the same directory or accessible in PYTHONPATH
-from run import process_pdfs_in_directory 
+from main import process_pdfs_in_directory 
 from docling.datamodel.pipeline_options import AcceleratorDevice # Added import
 
 class TestPdfProcessing(unittest.TestCase):
@@ -21,6 +21,10 @@ class TestPdfProcessing(unittest.TestCase):
         self.test_dir = Path(tempfile.mkdtemp())
         self.input_pdf_dir = self.test_dir / "input_pdfs"
         self.input_pdf_dir.mkdir()
+
+        # Create the expected subdirectory structure for testing path segment extraction
+        self.structured_input_dir = self.input_pdf_dir / "Part_I" / "Affiliate_Agreements"
+        self.structured_input_dir.mkdir(parents=True, exist_ok=True)
         
         # Output files for different configurations
         self.cpu_sequential_output_file = self.test_dir / "output_chunks_cpu_sequential.csv"
@@ -39,7 +43,8 @@ class TestPdfProcessing(unittest.TestCase):
 
         for source_pdf_path in self.source_agreements_dir.glob("*.pdf"):
             if source_pdf_path.is_file():
-                target_pdf_path = self.input_pdf_dir / source_pdf_path.name
+                # Copy PDFs into the structured directory
+                target_pdf_path = self.structured_input_dir / source_pdf_path.name
                 shutil.copy(source_pdf_path, target_pdf_path)
                 self.source_pdf_names.add(source_pdf_path.name)
                 copied_pdf_count += 1
