@@ -6,246 +6,169 @@ from typing import List, Dict, Any, Set
 import argparse
 import concurrent.futures
 import os
+import platform
+import warnings
+from tqdm.auto import tqdm
+from rich.logging import RichHandler
+from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+from rich.console import Console
+from rich import print as rich_print
+
+# Filter out specific deprecation warnings from docling
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="docling")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="docling_core")
+# Filter out tokenizer sequence length warnings
+warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum sequence length")
 
 # Explicitly set TOKENIZERS_PARALLELISM to false to avoid warnings and potential deadlocks/slowdowns in forked processes.
-# This addresses the warning: "huggingface/tokenizers: The current process just got forked, after parallelism has already been used..."
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OMP_NUM_THREADS"] = "1"
 
 from docling.chunking import HybridChunker
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure rich console
+console = Console()
+
+# Configure rich logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(rich_tracebacks=True, markup=True)]
+)
 logger = logging.getLogger(__name__)
 
 # Reduce verbosity of docling's logger
 logging.getLogger("docling").setLevel(logging.WARNING)
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 def _get_processed_pdfs(progress_file: Path) -> Set[str]:
-    """
-    Reads the progress file to get a set of already processed PDF paths.
-    
-    Args:
-        progress_file: Path to the progress tracking file
-        
-    Returns:
-        Set of absolute paths of PDFs that have already been processed
-    """
-    processed_pdfs = set()
-    if progress_file.exists():
-        try:
-            with open(progress_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        processed_pdfs.add(line)
-            logger.info(f"Found {len(processed_pdfs)} previously processed PDFs in progress file")
-        except Exception as e:
-            logger.error(f"Error reading progress file {progress_file}: {e}")
-    return processed_pdfs
+    """Reads the progress file to get a set of already processed PDF paths."""
+    if not progress_file.exists():
+        return set()
+    try:
+        with open(progress_file, 'r', encoding='utf-8') as f:
+            processed_pdfs = {line.strip() for line in f if line.strip()}
+        logger.info(f"Found [bold cyan]{len(processed_pdfs)}[/] previously processed PDFs")
+        return processed_pdfs
+    except Exception as e:
+        logger.error(f"Error reading progress file: [bold red]{e}[/]")
+        return set()
 
 def _update_processed_pdfs(progress_file: Path, pdf_path: Path) -> None:
-    """
-    Adds a PDF path to the progress file.
-    
-    Args:
-        progress_file: Path to the progress tracking file
-        pdf_path: Path of the PDF that was successfully processed
-    """
+    """Adds a PDF path to the progress file."""
     try:
         with open(progress_file, 'a', encoding='utf-8') as f:
-            f.write(f"{pdf_path.absolute()}\n")
+            f.write(f"{pdf_path.absolute()}\\n")
     except Exception as e:
-        logger.error(f"Error updating progress file {progress_file}: {e}")
+        logger.error(f"Error updating progress file for [bold]{pdf_path.name}[/]: [bold red]{e}[/]")
 
 def _write_chunks_to_csv(output_file: Path, chunks: List[Dict[str, Any]], append: bool = False, field_names_to_use: List[str] | None = None) -> List[str] | None:
-    """
-    Writes or appends chunks to the output CSV file.
-    Dynamically determines field names if not provided (for new files) or reads header if appending.
-    
-    Args:
-        output_file: Path to the output CSV file
-        chunks: List of chunk dictionaries to write
-        append: Whether to append to existing file content. If True and file exists, attempts to match header.
-                If False, overwrites or creates new.
-        field_names_to_use: Optional. If provided, these field names will be used.
-                            Crucial for ensuring consistency across multiple write operations in a single run.
-        
-    Returns:
-        The list of field names used for writing, or None if an error occurred or no chunks.
-    """
+    """Writes or appends chunks to CSV. Dynamically determines/validates header."""
     if not chunks:
-        return field_names_to_use # Return provided field_names or None if nothing to write and no names given
+        return field_names_to_use
 
     final_field_names = field_names_to_use
-    
-    # Determine file mode ('w' or 'a') and effective field names
-    mode = 'a' if append and output_file.exists() else 'w' # if append is requested and file exists, use 'a', otherwise 'w'
+    file_exists_and_not_empty = output_file.exists() and output_file.stat().st_size > 0
+    mode = 'a' if append and file_exists_and_not_empty else 'w'
 
-    if mode == 'a': # Appending to an existing file's content
-        if final_field_names:
-            # Fields are provided by the caller (e.g. established from a previous write in this run).
-            # Verify consistency with the actual file header on disk.
-            try:
-                with open(output_file, 'r', newline='', encoding='utf-8') as f_read:
-                    reader = csv.reader(f_read)
-                    existing_header = next(reader)
-                    if set(existing_header) != set(final_field_names):
-                        logger.error(f"Cannot append to {output_file}. Provided field names {final_field_names} "
-                                     f"do not match existing file header {existing_header}.")
-                        return None
-                    # Use the exact order from the existing header if sets match, for robustness
-                    final_field_names = existing_header
-            except StopIteration: # File is empty, even if it exists
-                logger.info(f"File {output_file} exists but is empty. Will write header as if it's a new file using provided/inferred fields.")
-                mode = 'w' # Treat as new file write for header purposes
-            except Exception as e:
-                logger.error(f"Error reading header from {output_file} for append verification: {e}. "
-                             f"Proceeding with provided field names {final_field_names}, but columns might mismatch.")
-                # Continue with final_field_names, hoping they are correct.
-        else:
-            # No field_names_to_use provided by caller, but we are in append mode (e.g. file existed at start of run).
-            # Must read header from the file.
-            try:
-                with open(output_file, 'r', newline='', encoding='utf-8') as f_read:
-                    reader = csv.reader(f_read)
-                    final_field_names = next(reader)
-                logger.info(f"Appending to {output_file}. Using existing header: {final_field_names}")
-            except StopIteration: # File is empty
-                 logger.info(f"File {output_file} exists but is empty. Will infer fields and write as new file.")
-                 mode = 'w' # Switch to write mode to infer and write header
-                 # final_field_names will be inferred below for 'w' mode
-            except Exception as e:
-                logger.error(f"Cannot append. Error reading header from existing file {output_file}: {e}. "
-                             "And no explicit field names provided by caller.")
+    if mode == 'a':
+        try:
+            with open(output_file, 'r', newline='', encoding='utf-8') as f_read:
+                reader = csv.reader(f_read)
+                existing_header = next(reader)
+            if final_field_names and set(existing_header) != set(final_field_names):
+                logger.error(f"Header mismatch. Provided: [bold]{final_field_names}[/], File: [bold]{existing_header}[/]")
                 return None
-    
-    if mode == 'w': # Writing a new file, or 'a' switched to 'w' because file was empty or didn't exist.
-        if not final_field_names: # Infer from chunks if not already set (e.g. from caller or failed append read)
-            all_keys = set()
-            for chunk in chunks:
-                all_keys.update(chunk.keys())
-            
-            if not all_keys:
-                logger.warning(f"No keys found in chunks for {output_file}, cannot infer header.")
-                return None
+            final_field_names = existing_header # Use header from file if appending
+        except StopIteration: # File exists but is empty
+            logger.info(f"File is empty, writing as new")
+            mode = 'w' # Fallback to write mode
+        except Exception as e:
+            logger.error(f"Error reading header for append: [bold red]{e}[/]")
+            # If final_field_names is None here, it will be inferred in 'w' mode logic
+            if not final_field_names: mode = 'w' # Force infer if no fields and error
 
-            # Define a preferred order for base keys
-            base_keys_ordered = ["id", "text", "source_pdf_filename", "heading", "page_number", 
-                                 "document_title", "part", "category", "docling_origin_filename",
-                                 "docling_origin_meta_json"]
-            
-            # Start with base keys that are actually present, in preferred order
-            inferred_names = [bk for bk in base_keys_ordered if bk in all_keys]
-            
-            # Add other keys (not base, not path_segment) sorted alphabetically
-            other_keys = sorted([k for k in all_keys if k not in inferred_names and not k.startswith("path_segment_")])
-            inferred_names.extend(other_keys)
+    if mode == 'w' and not final_field_names:
+        all_keys = {key for chunk in chunks for key in chunk.keys()}
+        if not all_keys:
+            logger.warning(f"Warning: No keys in chunks, cannot infer header")
+            return None
+        base_keys = ["id", "text", "source_pdf_filename", "heading", "page_number", "document_title", "docling_origin_filename", "docling_origin_meta_json"]
+        final_field_names = [bk for bk in base_keys if bk in all_keys]
+        final_field_names.extend(sorted([k for k in all_keys if k not in final_field_names and not k.startswith("path_segment_")]))
+        final_field_names.extend(sorted([k for k in all_keys if k.startswith("path_segment_")], key=lambda x: int(x.split('_')[-1])))
+        logger.info(f"📊 Determined CSV structure with [bold cyan]{len(final_field_names)}[/] columns. Fields:\n" + "\n".join(f"  [bold]•[/] [bright_blue]{fn}[/bright_blue]" for fn in final_field_names))
 
-            # Add path_segment_N keys, sorted numerically by N
-            path_segment_keys = sorted([k for k in all_keys if k.startswith("path_segment_")], 
-                                       key=lambda x: int(x.split('_')[-1]))
-            inferred_names.extend(path_segment_keys)
-            
-            final_field_names = inferred_names
-            logger.info(f"Writing new CSV ({output_file}). Inferred header: {final_field_names}")
-        # If final_field_names were already provided (e.g. by caller for a 'w' mode), use them.
-        # This path also handles the case where an 'append' to an empty file switched to 'w' with pre-set final_field_names.
-
-
-    if not final_field_names: # Should be caught by now, but as a safeguard
-        logger.error(f"CSV field names for {output_file} could not be determined.")
+    if not final_field_names:
+        logger.error("❌ CSV field names could not be determined")
         return None
 
     try:
         with open(output_file, mode, newline='', encoding='utf-8') as f:
-            # Use extrasaction='raise' to catch if a chunk has fields not in final_field_names.
-            # Use restval='' to write an empty string for fields in final_field_names but missing from a chunk.
             writer = csv.DictWriter(f, fieldnames=final_field_names, restval='', extrasaction='raise')
-            
-            if mode == 'w': # Only write header if we are in 'w' mode (new file, or overwrite)
+            if mode == 'w':
                 writer.writeheader()
-            
-            for item in chunks:
-                # Ensure item conforms to final_field_names (DictWriter handles this with restval and extrasaction)
-                writer.writerow(item)
+            writer.writerows(chunks)
         return final_field_names
     except Exception as e:
-        logger.error(f"Error writing {len(chunks)} chunks to {output_file} (mode {mode}): {e}", exc_info=True)
+        logger.error(f"❌ Error writing chunks: [bold red]{e}[/]")
         return None
 
 # Helper function to process a single PDF
 # This function will be run in parallel by the ProcessPoolExecutor
-def _process_single_pdf(pdf_path: Path, pdf_directory: Path, do_ocr: bool, do_table_structure: bool, chunk_tokenizer_name: str | None, accelerator_device: AcceleratorDevice) -> List[Dict[str, Any]]:
-    """
-    Processes a single PDF file, chunks it, and returns structured chunk data.
-    Initializes its own DocumentConverter and Chunker instances for process safety.
-    Accepts do_ocr, do_table_structure, and chunk_tokenizer_name options.
-    Dynamically adds path_segment_N fields based on directory structure.
-    """
-    # Reduced verbosity: Changed from INFO to DEBUG
-    logger.debug(f"Worker processing PDF: {pdf_path.name} using {accelerator_device.value}, OCR: {do_ocr}, Table Structure: {do_table_structure}, Tokenizer: {chunk_tokenizer_name or 'default'}")
+def _process_single_pdf(pdf_path: Path, pdf_directory: Path, do_ocr: bool, do_table_structure: bool, chunk_tokenizer_name: str | None, accelerator_device: AcceleratorDevice, chunk_size: int, chunk_overlap: int) -> List[Dict[str, Any]]:
+    """Processes a single PDF, chunks it, and returns structured chunk data."""    
+    # Filter out specific deprecation warnings from docling within the worker
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module="docling")
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module="docling_core")
+    # Filter out tokenizer sequence length warnings within the worker
+    warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum sequence length")
     
-    accelerator_opts = AcceleratorOptions(device=accelerator_device)
     pdf_pipeline_options = PdfPipelineOptions(
         do_ocr=do_ocr, 
         do_table_structure=do_table_structure,
-        accelerator_options=accelerator_opts
+        accelerator_options=AcceleratorOptions(device=accelerator_device)
     )
-    doc_converter = DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(
-            pipeline_options=pdf_pipeline_options
-        )}
-    )
-    chunker = HybridChunker(tokenizer=chunk_tokenizer_name) if chunk_tokenizer_name else HybridChunker()
+    doc_converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_pipeline_options)})
+    chunker_args = {"chunk_size": chunk_size, "overlap": chunk_overlap}
+    if chunk_tokenizer_name:
+        chunker_args["tokenizer"] = chunk_tokenizer_name
+    chunker = HybridChunker(**chunker_args)
     
     single_pdf_chunks: List[Dict[str, Any]] = []
 
     try:
         docling_document = doc_converter.convert(str(pdf_path)).document
         for i, chunk in enumerate(chunker.chunk(dl_doc=docling_document)):
-            chunk_text = chunker.serialize(chunk)
+            chunk_text = chunker.contextualize(chunk)
             
             origin_filename = None
             origin_meta_others_json = None
             if chunk.meta and chunk.meta.origin:
                 origin_filename = chunk.meta.origin.filename
-                origin_dict = dict(chunk.meta.origin)
-                if 'filename' in origin_dict:
-                    del origin_dict['filename']
+                origin_dict = {k: v for k, v in chunk.meta.origin.model_dump().items() if k != 'filename' and v is not None}
                 if origin_dict:
                     origin_meta_others_json = json.dumps(origin_dict)
 
-            current_heading = None
-            if chunk.meta and chunk.meta.headings and len(chunk.meta.headings) > 0:
-                current_heading = chunk.meta.headings[0]
-
+            current_heading = chunk.meta.headings[0] if chunk.meta and chunk.meta.headings else None
             page_number = None
-            if (chunk.meta and 
-                chunk.meta.doc_items and 
-                len(chunk.meta.doc_items) > 0 and
-                chunk.meta.doc_items[0].prov and
-                len(chunk.meta.doc_items[0].prov) > 0 and
-                hasattr(chunk.meta.doc_items[0].prov[0], 'page_no') and
-                chunk.meta.doc_items[0].prov[0].page_no is not None):
+            if chunk.meta and chunk.meta.doc_items and chunk.meta.doc_items[0].prov and hasattr(chunk.meta.doc_items[0].prov[0], 'page_no'):
                 page_number = chunk.meta.doc_items[0].prov[0].page_no
             
             path_derived_metadata: Dict[str, Any] = {}
             try:
-                relative_path_to_pdf = pdf_path.relative_to(pdf_directory)
-                directory_components = relative_path_to_pdf.parts[:-1] # Exclude filename
-                for idx, component_name in enumerate(directory_components):
-                    path_derived_metadata[f"path_segment_{idx}"] = component_name
+                # Path segments are relative to the pdf_directory itself
+                relative_path_parts = pdf_path.relative_to(pdf_directory).parts[:-1]
+                path_derived_metadata = {f"path_segment_{idx}": name for idx, name in enumerate(relative_path_parts)}
             except ValueError:
-                logger.warning(f"Could not determine relative path for {pdf_path} under {pdf_directory}. Path segments missing.")
-            except Exception as path_e:
-                logger.warning(f"Error extracting path metadata for {pdf_path}: {path_e}")
-
-            part_val = path_derived_metadata.get("path_segment_0")
-            category_val = path_derived_metadata.get("path_segment_1")
+                pass
+            except Exception:
+                pass
 
             chunk_data = {
                 "id": f"{pdf_path.stem}-{i}",
@@ -253,282 +176,206 @@ def _process_single_pdf(pdf_path: Path, pdf_directory: Path, do_ocr: bool, do_ta
                 "source_pdf_filename": pdf_path.name,
                 "heading": current_heading,
                 "page_number": page_number,
-                "document_title": pdf_path.stem, # Using pdf_path.stem for document_title
-                "part": part_val,
-                "category": category_val,
+                "document_title": pdf_path.stem, 
                 "docling_origin_filename": origin_filename,
                 "docling_origin_meta_json": origin_meta_others_json,
+                **path_derived_metadata # Merge path segments directly
             }
-            # Add remaining path segments (path_segment_2 onwards, if any)
-            remaining_path_segments = {
-                k: v for k, v in path_derived_metadata.items()
-                if k not in ["path_segment_0", "path_segment_1"]
-            }
-            chunk_data.update(remaining_path_segments)
             single_pdf_chunks.append(chunk_data)
+            
     except Exception as e:
-        logger.error(f"Error processing PDF {pdf_path.name} in worker: {e}", exc_info=True)
-        # Return empty list for this PDF if an error occurs, to not break the whole batch
-        return []
+        logger.error(f"❌ Failed to process [bold]{pdf_path.name}[/]: [bold red]{e}[/]")
+        return [] # Return empty on error for this PDF
         
     return single_pdf_chunks
 
-def process_pdfs_in_directory(pdf_directory: Path, output_file: Path, ignore_dirs: List[str] = None, use_concurrency: bool = True, do_ocr: bool = False, do_table_structure: bool = False, chunk_tokenizer_name: str | None = None, accelerator_device: AcceleratorDevice = AcceleratorDevice.CPU) -> None:
-    """
-    Processes all PDF files in the given directory, chunks them,
-    and writes the structured chunk data to an output CSV file.
-    Can use concurrent workers for speed.
-    Accepts an accelerator_device option.
-    Supports resuming from previous runs.
-    Dynamically determines CSV schema.
-    """
-    if ignore_dirs is None:
-        ignore_dirs = []
-    
+def process_pdfs_in_directory(pdf_directory: Path, output_file: Path, ignore_dirs: List[str] = None, use_concurrency: bool = True, do_ocr: bool = False, do_table_structure: bool = False, chunk_tokenizer_name: str | None = None, accelerator_device: AcceleratorDevice = AcceleratorDevice.CPU, chunk_size: int = 1000, chunk_overlap: int = 200) -> None:
+    """Processes PDFs in a directory, chunks them, and writes to CSV, with concurrency and resume support."""
+    ignore_dirs = ignore_dirs or []
     progress_file = output_file.with_name(f"{output_file.name}.processed_pdfs.log")
-    processed_pdfs = _get_processed_pdfs(progress_file)
+    processed_pdf_paths = _get_processed_pdfs(progress_file)
     
-    pdf_files_all = list(pdf_directory.glob("**/*.pdf"))
-    pdf_files = []
-    
-    for pdf_path in pdf_files_all:
-        if any(ignored_dir in pdf_path.parts for ignored_dir in ignore_dirs):
-            logger.info(f"Skipping {pdf_path} as it is in an ignored directory.")
-            continue
-        if str(pdf_path.absolute()) in processed_pdfs:
-            logger.info(f"Skipping {pdf_path} as it was already processed.")
-            continue
-        pdf_files.append(pdf_path)
+    all_pdf_files = list(pdf_directory.glob("**/*.pdf"))
+    pdf_files_to_process = [
+        pdf_path for pdf_path in all_pdf_files
+        if not any(ignored_dir in pdf_path.parts for ignored_dir in ignore_dirs) and 
+           str(pdf_path.absolute()) not in processed_pdf_paths
+    ]
 
-    if not pdf_files:
-        logger.warning(f"No new PDF files to process in {pdf_directory}")
+    # Display skipped files info
+    skipped_count = 0
+    for pdf_path in all_pdf_files:
+        if str(pdf_path.absolute()) in processed_pdf_paths:
+            skipped_count += 1
+        elif any(ignored_dir in pdf_path.parts for ignored_dir in ignore_dirs):
+            skipped_count += 1
+
+    if skipped_count > 0:
+        logger.info(f"Skipping [bold yellow]{skipped_count}[/] PDFs (already processed or in ignored directories)")
+
+    if not pdf_files_to_process:
+        logger.warning("Warning: [bold yellow]No new PDF files to process[/]")
         return
 
-    logger.info(f"Found {len(pdf_files)} new PDF files to process in {pdf_directory}. Concurrency: {use_concurrency}, Accelerator: {accelerator_device.value}, OCR: {do_ocr}, Table Structure: {do_table_structure}, Tokenizer: {chunk_tokenizer_name or 'default'}")
+    # Create a summary of the processing configuration
+    config_summary = [
+        f"Directory: [bold cyan]{pdf_directory}[/]",
+        f"Concurrency: [bold]{'Enabled' if use_concurrency else 'Disabled'}[/]",
+        f"Accelerator: [bold cyan]{accelerator_device.value}[/]",
+        f"OCR: [bold]{'Enabled' if do_ocr else 'Disabled'}[/]",
+        f"Table Structure: [bold]{'Enabled' if do_table_structure else 'Disabled'}[/]",
+        f"Tokenizer: [bold cyan]{chunk_tokenizer_name or 'default'}[/]",
+        f"Chunk Size: [bold cyan]{chunk_size}[/]",
+        f"Overlap: [bold cyan]{chunk_overlap}[/]"
+    ]
+    
+    logger.info(f"[bold green]Processing {len(pdf_files_to_process)} PDFs[/]")
+    for config_line in config_summary:
+        logger.info(config_line)
 
-    # Master list of field names for the current CSV file. Established by the first successful write.
     master_csv_fields: List[str] | None = None
-    # Tracks if any write has successfully occurred in this run, to determine append_operation status for _write_chunks_to_csv
     has_written_this_run = False
     
     if use_concurrency:
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            batch_size = min(10, len(pdf_files)) 
-            
-            for batch_start in range(0, len(pdf_files), batch_size):
-                batch_end = min(batch_start + batch_size, len(pdf_files))
-                current_batch = pdf_files[batch_start:batch_end]
-                
-                logger.info(f"Processing batch of {len(current_batch)} PDFs ({batch_start+1}-{batch_end} of {len(pdf_files)})")
-                
-                future_to_pdf = {
-                    executor.submit(_process_single_pdf, pdf_path, pdf_directory, do_ocr, do_table_structure, chunk_tokenizer_name, accelerator_device): pdf_path 
-                    for pdf_path in current_batch
-                }
-                
-                batch_chunks_for_csv = []
-                successfully_processed_pdfs_in_batch: List[Path] = []
+        cpu_cores = os.cpu_count() or 1
+        max_workers = min(4, cpu_cores // 2 if cpu_cores > 1 else 1)
+        logger.info(f"Using [bold cyan]{max_workers}[/] worker processes")
 
-                for future in concurrent.futures.as_completed(future_to_pdf):
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_pdf = {
+                executor.submit(_process_single_pdf, pdf_path, pdf_directory, do_ocr, do_table_structure, chunk_tokenizer_name, accelerator_device, chunk_size, chunk_overlap): pdf_path 
+                for pdf_path in pdf_files_to_process
+            }
+            
+            all_chunks_for_csv = []
+            successfully_processed_pdfs_in_run: List[Path] = []
+
+            # Create progress bar for concurrent processing
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeRemainingColumn(),
+                console=console
+            ) as progress:
+                task = progress.add_task("[cyan]Processing PDFs...", total=len(pdf_files_to_process))
+                
+                for i, future in enumerate(concurrent.futures.as_completed(future_to_pdf)):
                     pdf_path_completed = future_to_pdf[future]
                     try:
                         chunks_from_pdf = future.result()
                         if chunks_from_pdf:
-                            batch_chunks_for_csv.extend(chunks_from_pdf)
-                            successfully_processed_pdfs_in_batch.append(pdf_path_completed)
-                            logger.info(f"Completed processing for {pdf_path_completed.name}, found {len(chunks_from_pdf)} chunks.")
+                            all_chunks_for_csv.extend(chunks_from_pdf)
+                            successfully_processed_pdfs_in_run.append(pdf_path_completed)
+                            progress.update(task, advance=1, description=f"[cyan]Processing PDFs... ({i+1}/{len(pdf_files_to_process)})")
                         else:
-                            logger.info(f"No chunks returned from {pdf_path_completed.name} (it might have failed or produced no chunks).")
+                            progress.update(task, advance=1, description=f"[yellow]Processing PDFs... ({i+1}/{len(pdf_files_to_process)})")
                     except Exception as exc:
-                        logger.error(f"{pdf_path_completed.name} generated an exception during concurrent execution: {exc}", exc_info=True)
-                
-                if batch_chunks_for_csv:
-                    logger.info(f"Writing {len(batch_chunks_for_csv)} chunks from batch to {output_file}")
-                    
-                    returned_fields = _write_chunks_to_csv(
-                        output_file, 
-                        batch_chunks_for_csv, 
-                        append=has_written_this_run,
-                        field_names_to_use=master_csv_fields
-                    )
-                    
-                    if returned_fields:
-                        logger.info(f"Successfully wrote batch chunks to {output_file}")
-                        if not has_written_this_run:
-                            master_csv_fields = returned_fields # Establish master fields
-                            has_written_this_run = True
-                        
-                        # Update progress for successfully processed PDFs in this batch
-                        for pdf_done in successfully_processed_pdfs_in_batch:
-                            _update_processed_pdfs(progress_file, pdf_done)
-                    else:
-                        logger.error(f"Failed to write batch chunks to {output_file}. Progress for this batch not updated.")
-    else:  # Sequential processing
-        logger.info("Processing PDFs sequentially.")
-        accelerator_opts_seq = AcceleratorOptions(device=accelerator_device)
-        pdf_pipeline_options_seq = PdfPipelineOptions(
-            do_ocr=do_ocr,
-            do_table_structure=do_table_structure,
-            accelerator_options=accelerator_opts_seq
-        )
-        doc_converter_seq = DocumentConverter(
-            format_options={InputFormat.PDF: PdfFormatOption(
-                pipeline_options=pdf_pipeline_options_seq
-            )}
-        )
-        chunker_seq = HybridChunker(tokenizer=chunk_tokenizer_name) if chunk_tokenizer_name else HybridChunker()
-
-        for i, pdf_path in enumerate(pdf_files):
-            logger.info(f"Processing PDF {i+1}/{len(pdf_files)}: {pdf_path.name} using {accelerator_device.value}, OCR: {do_ocr}, Table Structure: {do_table_structure}, Tokenizer: {chunk_tokenizer_name or 'default'}")
+                        logger.error(f"❌ PDF [bold]{pdf_path_completed.name}[/] failed: [bold red]{exc}[/]")
+                        progress.update(task, advance=1, description=f"[red]Processing PDFs... ({i+1}/{len(pdf_files_to_process)})")
             
-            pdf_chunks_for_csv = []
-            try:
-                docling_document = doc_converter_seq.convert(str(pdf_path)).document
-                for j, chunk in enumerate(chunker_seq.chunk(dl_doc=docling_document)):
-                    chunk_text = chunker_seq.serialize(chunk)
-                    origin_filename = None
-                    origin_meta_others_json = None
-                    if chunk.meta and chunk.meta.origin:
-                        origin_filename = chunk.meta.origin.filename
-                        origin_dict = dict(chunk.meta.origin)
-                        if 'filename' in origin_dict: del origin_dict['filename']
-                        if origin_dict: origin_meta_others_json = json.dumps(origin_dict)
-
-                    current_heading = chunk.meta.headings[0] if chunk.meta and chunk.meta.headings else None
-                    page_number = None
-                    if (chunk.meta and chunk.meta.doc_items and len(chunk.meta.doc_items) > 0 and
-                            chunk.meta.doc_items[0].prov and len(chunk.meta.doc_items[0].prov) > 0 and
-                            hasattr(chunk.meta.doc_items[0].prov[0], 'page_no') and
-                            chunk.meta.doc_items[0].prov[0].page_no is not None):
-                        page_number = chunk.meta.doc_items[0].prov[0].page_no
-
-                    path_derived_metadata: Dict[str, Any] = {}
-                    try:
-                        relative_path_to_pdf = pdf_path.relative_to(pdf_directory)
-                        directory_components = relative_path_to_pdf.parts[:-1]
-                        for idx, component_name in enumerate(directory_components):
-                            path_derived_metadata[f"path_segment_{idx}"] = component_name
-                    except ValueError:
-                        logger.warning(f"Could not determine relative path for {pdf_path} under {pdf_directory}")
-                    except Exception as path_e:
-                        logger.warning(f"Error extracting path metadata for {pdf_path}: {path_e}")
-                    
-                    part_val = path_derived_metadata.get("path_segment_0")
-                    category_val = path_derived_metadata.get("path_segment_1")
-                    
-                    chunk_data = {
-                        "id": f"{pdf_path.stem}-{j}", "text": chunk_text,
-                        "source_pdf_filename": pdf_path.name, "heading": current_heading,
-                        "page_number": page_number, "document_title": pdf_path.stem,
-                        "part": part_val,
-                        "category": category_val,
-                        "docling_origin_filename": origin_filename,
-                        "docling_origin_meta_json": origin_meta_others_json,
-                    }
-                    # Add remaining path segments (path_segment_2 onwards, if any)
-                    remaining_path_segments = {
-                        k: v for k, v in path_derived_metadata.items()
-                        if k not in ["path_segment_0", "path_segment_1"]
-                    }
-                    chunk_data.update(remaining_path_segments)
-                    pdf_chunks_for_csv.append(chunk_data)
+            if all_chunks_for_csv:
+                logger.info(f"Writing [bold cyan]{len(all_chunks_for_csv)}[/] chunks from [bold cyan]{len(successfully_processed_pdfs_in_run)}[/] PDFs")
+                returned_fields = _write_chunks_to_csv(
+                    output_file, 
+                    all_chunks_for_csv, 
+                    append=output_file.exists() and output_file.stat().st_size > 0,
+                    field_names_to_use=master_csv_fields
+                )
                 
-                if pdf_chunks_for_csv:
-                    logger.info(f"Writing {len(pdf_chunks_for_csv)} chunks from {pdf_path.name} to {output_file}")
+                if returned_fields:
+                    logger.info(f"[bold green]Successfully wrote data to {output_file.name}[/]")
+                    if not has_written_this_run:
+                        master_csv_fields = returned_fields 
+                        has_written_this_run = True
+                    
+                    for pdf_done in successfully_processed_pdfs_in_run:
+                        _update_processed_pdfs(progress_file, pdf_done)
+                else:
+                    logger.error(f"[bold red]Failed to write data to {output_file.name}[/]")
+
+    else:  # Sequential processing
+        logger.info("Processing PDFs sequentially")
+        
+        # Create progress bar for sequential processing
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("[cyan]Processing PDFs...", total=len(pdf_files_to_process))
+            
+            for i, pdf_path in enumerate(pdf_files_to_process):
+                progress.update(task, description=f"[cyan]Processing: {pdf_path.name}")
+                
+                # Call _process_single_pdf directly for sequential processing
+                pdf_chunks = _process_single_pdf(pdf_path, pdf_directory, do_ocr, do_table_structure, chunk_tokenizer_name, accelerator_device, chunk_size, chunk_overlap)
+                
+                if pdf_chunks:
+                    should_append_this_pdf = has_written_this_run or (output_file.exists() and output_file.stat().st_size > 0)
                     
                     returned_fields = _write_chunks_to_csv(
                         output_file, 
-                        pdf_chunks_for_csv, 
-                        append=has_written_this_run,
+                        pdf_chunks, 
+                        append=should_append_this_pdf,
                         field_names_to_use=master_csv_fields
                     )
 
                     if returned_fields:
-                        logger.info(f"Successfully wrote chunks from {pdf_path.name} to {output_file}")
                         if not has_written_this_run:
                             master_csv_fields = returned_fields
                             has_written_this_run = True
                         _update_processed_pdfs(progress_file, pdf_path)
+                        progress.update(task, advance=1, description=f"[green]Processed: {pdf_path.name}")
                     else:
-                        logger.error(f"Failed to write chunks from {pdf_path.name}. Progress not updated.")
+                        logger.error(f"❌ Failed to write chunks from [bold]{pdf_path.name}[/]")
+                        progress.update(task, advance=1, description=f"[red]Failed: {pdf_path.name}")
                 else:
-                    logger.info(f"No chunks generated from {pdf_path.name}")
-            except Exception as e:
-                logger.error(f"Error processing PDF {pdf_path.name} sequentially: {e}", exc_info=True)
-                continue
+                    progress.update(task, advance=1, description=f"[yellow]No chunks: {pdf_path.name}")
 
-    logger.info("Processing complete.")
+    logger.info("[bold green]Processing complete![/]")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Process PDF files and chunk them.")
-    parser.add_argument(
-        "input_dir",
-        type=str,
-        help="Directory containing PDF files to process."
-    )
-    parser.add_argument(
-        "output_file",
-        type=str,
-        help="Path to the output CSV file."
-    )
-    parser.add_argument(
-        "--ignore-dirs",
-        type=str,
-        nargs='+',
-        default=[],
-        help="List of directory names to ignore (e.g., --ignore-dirs dir1 sub_dir2)."
-    )
-    parser.add_argument(
-        "--accelerator",
-        type=str,
-        default="mps",
-        choices=["cpu", "mps"],
-        help="Accelerator device to use ('cpu' or 'mps'). Default is 'mps'."
-    )
-    parser.add_argument(
-        "--concurrent",
-        action="store_true",
-        help="Run PDF processing concurrently instead of sequentially."
-    )
-    parser.add_argument(
-        "--do-ocr",
-        action="store_true",
-        help="Enable OCR during PDF processing. Defaults to False."
-    )
-    parser.add_argument(
-        "--do-table-structure",
-        action="store_true",
-        help="Enable table structure recognition during PDF processing. Defaults to False."
-    )
-    parser.add_argument(
-        "--chunk-tokenizer",
-        type=str,
-        default=None,
-        help="Specify the tokenizer for HybridChunker (e.g., 'BAAI/bge-small-en-v1.5'). Uses docling default if not specified."
-    )
+    parser = argparse.ArgumentParser(description="Process PDF files, chunk them, and output to CSV.")
+    parser.add_argument("input_dir", type=str, help="Directory containing PDF files.")
+    parser.add_argument("output_file", type=str, help="Path to the output CSV file.")
+    parser.add_argument("--ignore-dirs", type=str, nargs='+', default=[], help="Directory names to ignore.")
+    parser.add_argument("--accelerator", type=str, default="cpu", choices=["cpu", "mps"], help="Accelerator: 'cpu' or 'mps'. Default: 'cpu'.")
+    parser.add_argument("--concurrent", action="store_true", help="Enable concurrent PDF processing.")
+    parser.add_argument("--do-ocr", action="store_true", help="Enable OCR during PDF processing.")
+    parser.add_argument("--do-table-structure", action="store_true", help="Enable table structure recognition.")
+    parser.add_argument("--chunk-tokenizer", type=str, default=None, help="Tokenizer for HybridChunker (e.g., 'BAAI/bge-small-en-v1.5').")
+    parser.add_argument("--chunk-size", type=int, default=500, help="Target chunk size. Default: 500.")
+    parser.add_argument("--chunk-overlap", type=int, default=100, help="Chunk overlap. Default: 100.")
+
     args = parser.parse_args()
 
-    # Define the input directory for PDFs and the output file path
+    # Use rich to print a nice welcome message
+    rich_print("\n[bold cyan]DocuNomic PDF Processor[/]\n")
+
+    # Set multiprocessing start method to 'spawn' if not already set, especially for macOS/MPS.
+    try:
+        import multiprocessing
+        current_method = multiprocessing.get_start_method(allow_none=True)
+        if current_method != 'spawn':
+            force_spawn = True if current_method else False
+            multiprocessing.set_start_method('spawn', force=force_spawn)
+            logger.info(f"Multiprocessing start method: [bold cyan]spawn[/] (was: {current_method})")
+        else:
+            logger.info(f"Multiprocessing start method: [bold cyan]spawn[/]")
+    except Exception as e:
+        logger.warning(f"Could not set multiprocessing start method: [bold yellow]{e}[/]")
+
+    selected_accelerator = AcceleratorDevice.MPS if args.accelerator == "mps" else AcceleratorDevice.CPU
+
     pdf_input_dir = Path(args.input_dir)
     output_csv_file = Path(args.output_file)
 
-    selected_accelerator = AcceleratorDevice.CPU
-    if args.accelerator == "mps":
-        selected_accelerator = AcceleratorDevice.MPS
-        # Attempt to set start method to 'spawn' if MPS is selected, as it's often recommended.
-        try:
-            import multiprocessing
-            if multiprocessing.get_start_method(allow_none=True) != 'spawn':
-                multiprocessing.set_start_method('spawn', force=True)
-                logger.info("Set multiprocessing start method to 'spawn' for MPS.")
-        except Exception as e:
-            logger.warning(f"Could not set multiprocessing start method to 'spawn' for MPS: {e}. This might be an issue if not already set, or on certain platforms.")
-
     if not pdf_input_dir.is_dir():
-        logger.error(f"Input PDF directory not found: {pdf_input_dir.resolve()}")
-        logger.error("Please ensure the directory exists and contains PDF files.")
+        logger.error(f"❌ [bold red]Input directory not found: {pdf_input_dir.resolve()}[/]")
     else:
-        # Pass the concurrency flag and accelerator from args
         process_pdfs_in_directory(
             pdf_input_dir, 
             output_csv_file, 
@@ -537,7 +384,7 @@ if __name__ == '__main__':
             do_ocr=args.do_ocr,
             do_table_structure=args.do_table_structure,
             chunk_tokenizer_name=args.chunk_tokenizer,
-            accelerator_device=selected_accelerator
+            accelerator_device=selected_accelerator,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap
         )
-
-    logger.info("Processing complete.")
